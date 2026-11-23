@@ -2711,19 +2711,26 @@ impl Page {
         // body is still an empty shell IS the SPA (issue #205), so give it the
         // full script budget and the app module still mounts.
         let module_budget_ms: u64 = {
-            let body_nodes = self
+            // A document can have 50+ placeholder nodes before its
+            // application modules install any user input or form. Do not treat
+            // that shell as a rendered interactive application: the 3s graph
+            // stall allowance can abort slow but healthy module fetches.
+            let (body_nodes, has_application_controls) = self
                 .js
                 .as_ref()
                 .and_then(|js| {
                     js.with_dom(|dom| {
-                        dom.query_selector("body")
+                        let nodes = dom.query_selector("body")
                             .ok()
                             .flatten()
                             .map(|b| dom.descendants(b).len())
-                            .unwrap_or(0)
+                            .unwrap_or(0);
+                        let controls = ["form", "input", "textarea", "select"].iter()
+                            .any(|selector| dom.query_selector(selector).ok().flatten().is_some());
+                        (nodes, controls)
                     })
                 })
-                .unwrap_or(0);
+                .unwrap_or((0, false));
             let short_ms: u64 = module_budget_override.unwrap_or_else(|| {
                 std::env::var("OBSCURA_MODULE_BUDGET_MS")
                     .ok()
@@ -2732,7 +2739,7 @@ impl Page {
             });
             // A rendered body has hundreds of descendants; an unmounted Vite/Next
             // shell is <root> plus maybe a spinner.
-            if module_budget_override.is_some() || body_nodes > 50 {
+            if module_budget_override.is_some() || (body_nodes > 50 && has_application_controls) {
                 short_ms
             } else {
                 script_deadline_ms
@@ -9105,6 +9112,39 @@ mod tests {
         page.dom = Some(parse_html(html));
         page.init_js();
         page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn populated_shell_without_form_controls_allows_slow_module_graph() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            // Longer than the 3s already-rendered-page budget, but below the
+            // page-wide deadline. A skeleton must not abort this graph.
+            std::thread::sleep(std::time::Duration::from_millis(3600));
+            let body = "export const ready = true;";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let placeholders = "<div class='skeleton'></div>".repeat(65);
+        let html = format!(
+            "<html><body><main id='app'>{placeholders}</main><script type='module'>import './slow.js';globalThis.__shell_mounted=true;</script></body></html>"
+        );
+        let mut page = import_map_test_page("slow-shell-graph", &base, &html);
+        page.execute_scripts_with_module_budget(None).await;
+        let mounted = page.js.as_mut().unwrap()
+            .evaluate("globalThis.__shell_mounted === true").unwrap();
+        assert_eq!(mounted, serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
