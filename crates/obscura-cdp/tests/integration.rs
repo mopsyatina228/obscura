@@ -47,6 +47,7 @@ integration_tests!(
     form_submission_ownership,
     form_submit_method_bypasses_listener,
     formdata_submitter_conformance,
+    request_formdata_conformance,
     submit_event_email_conformance,
     html_serialization_escaping,
     iframe_event_dispatch,

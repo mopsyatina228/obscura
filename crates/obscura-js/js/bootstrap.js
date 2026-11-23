@@ -9419,7 +9419,8 @@ if (typeof Request === 'undefined') {
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(_filterRequestHeaders(init.headers));
       _requestHeaderGuards.add(this.headers);
-      this.body = init.body || null;
+      this.body = init.body == null ? null : init.body;
+      this._bodyUsed = false;
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
         ? String(init.credentials)
@@ -9436,7 +9437,37 @@ if (typeof Request === 'undefined') {
       this.signal = _createDependentAbortSignal(signal == null ? [] : [signal]);
       this.cache = init.cache || 'default';
     }
+    _consumeBody() {
+      if (this._bodyUsed) throw new TypeError('Body is already consumed');
+      this._bodyUsed = true;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    // React Router 7 constructs Request objects from form submissions and
+    // reads their body with request.formData() before invoking the action.
+    // Without the Fetch Body mixin this rejects before any network request
+    // can be dispatched, even though the submit event reached React.
+    async formData() {
+      this._consumeBody();
+      const body = this.body;
+      const result = new FormData();
+      if (body == null) return result;
+      if (body instanceof FormData) {
+        for (const [name, value] of body) result.append(name, value);
+        return result;
+      }
+      if (body instanceof URLSearchParams) {
+        for (const [name, value] of body) result.append(name, value);
+        return result;
+      }
+      if (typeof body === 'string' &&
+          /^application\/x-www-form-urlencoded(?:;|$)/i.test(this.headers.get('content-type') || '')) {
+        for (const [name, value] of new URLSearchParams(body)) result.append(name, value);
+        return result;
+      }
+      throw new TypeError('Could not parse Request body as FormData');
+    }
     clone() {
+      if (this.bodyUsed) throw new TypeError('Cannot clone a used Request body');
       return new Request(this.url, {
         method: this.method,
         headers: this.headers,
