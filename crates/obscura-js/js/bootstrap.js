@@ -5672,7 +5672,7 @@ class Element extends Node {
         );
       }
     }
-    const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    const cancelled = !this.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter ?? null }));
     if (cancelled) return;
     this._navigateSubmit(submitter);
   }
@@ -12320,7 +12320,16 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   }
 };
 globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+globalThis.SubmitEvent = class SubmitEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    // The HTML submit activation behavior and React/Remix form handlers inspect
+    // event.submitter to select the exact clicked button. A plain Event or an
+    // empty SubmitEvent wrapper silently discards that information.
+    this.submitter = init.submitter == null ? null : init.submitter;
+  }
+};
+_markNative(globalThis.SubmitEvent);
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
 // newState are "open"/"closed". These events do not bubble; beforetoggle is
@@ -20209,7 +20218,22 @@ if (!Element.prototype.validity) {
       if (!_ns_validityCache.has(this)) {
         _ns_validityCache.set(this, new ValidityState());
       }
-      return _ns_validityCache.get(this);
+      const state = _ns_validityCache.get(this);
+      const tag = String(this.tagName || '').toUpperCase();
+      if (tag === 'INPUT' && String(this.getAttribute('type') || '').toLowerCase() === 'email') {
+        const value = String(this.value || '');
+        const isList = this.hasAttribute('multiple');
+        // HTML email inputs do not accept whitespace or a second @ in one
+        // address. Multiple addresses must be explicitly opted into.
+        const isAddress = (candidate) => /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/.test(candidate);
+        state.typeMismatch = !!value && (isList
+          ? value.split(',').some((part) => !isAddress(part.trim()))
+          : !isAddress(value));
+      }
+      state.valid = !state.customError && !state.valueMissing && !state.typeMismatch &&
+        !state.patternMismatch && !state.badInput && !state.tooLong && !state.tooShort &&
+        !state.rangeUnderflow && !state.rangeOverflow && !state.stepMismatch;
+      return state;
     },
     enumerable: true,
     configurable: true
@@ -20238,18 +20262,17 @@ if (!Element.prototype.validationMessage) {
   });
 }
 
-// Element.prototype.checkValidity - stub returns true
+// Constraint validity must reflect input state rather than always succeeding.
 if (!Element.prototype.checkValidity) {
   Element.prototype.checkValidity = function checkValidity() {
-    return true;
+    return this.validity.valid;
   };
   _markNative(Element.prototype.checkValidity);
 }
 
-// Element.prototype.reportValidity - stub returns true
 if (!Element.prototype.reportValidity) {
   Element.prototype.reportValidity = function reportValidity() {
-    return true;
+    return this.checkValidity();
   };
   _markNative(Element.prototype.reportValidity);
 }

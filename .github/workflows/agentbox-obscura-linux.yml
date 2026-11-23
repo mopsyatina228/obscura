@@ -1,0 +1,43 @@
+name: AgentBox Obscura Linux candidate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-render:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      OPENSSL_NO_VENDOR: "1"
+    steps:
+      - name: Checkout exact selected source revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Attest commit
+        run: |
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake libclang-dev libssl-dev llvm-dev pkg-config
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Run submit event and email regression tests
+        run: cargo test --locked -p obscura-cdp --test integration submit_event_email_conformance -- --nocapture
+      - name: Build render-enabled Obscura binary
+        run: cargo build --locked --release -p obscura-cli --bins --features render
+      - name: Verify binary and fingerprint
+        run: |
+          test -x target/release/obscura
+          target/release/obscura --version
+          sha256sum target/release/obscura
+      - name: Upload Linux candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: obscura-agentbox-submit-event-20261123-linux-x86_64
+          path: target/release/obscura
+          retention-days: 7
