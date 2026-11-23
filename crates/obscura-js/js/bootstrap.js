@@ -5672,7 +5672,15 @@ class Element extends Node {
         );
       }
     }
-    const cancelled = !this.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter ?? null }));
+    // The browser constructs this event as a consequence of form activation,
+    // including requestSubmit(). Unlike a script-created SubmitEvent passed
+    // to dispatchEvent(), the browser-generated event is trusted. Keep the
+    // click event from HTMLElement.click() itself untrusted.
+    const submitEvent = new SubmitEvent('submit', {
+      bubbles: true, cancelable: true, submitter: submitter ?? null
+    });
+    globalThis.__obscura_markTrusted(submitEvent);
+    const cancelled = !this.dispatchEvent(submitEvent);
     if (cancelled) return;
     this._navigateSubmit(submitter);
   }

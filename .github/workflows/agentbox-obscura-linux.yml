@@ -34,6 +34,8 @@ jobs:
         run: cargo test --locked -p obscura-cdp --test integration request_formdata_conformance -- --nocapture
       - name: Test slow module graph on unmounted SPA shell
         run: cargo test --locked -p obscura-browser populated_shell_without_form_controls_allows_slow_module_graph -- --nocapture
+      - name: Verify trusted native form submit parity
+        run: cargo test --locked -p obscura-cdp --features render --test integration native_submit_event_trust -- --nocapture
       - name: Build render-enabled Obscura binary
         run: cargo build --locked --release -p obscura-cli --bins --features render
       - name: Verify binary and fingerprint
@@ -44,6 +46,6 @@ jobs:
       - name: Upload Linux candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: obscura-agentbox-module-budget-20261123-linux-x86_64
+          name: obscura-agentbox-native-submit-20261123-linux-x86_64
           path: target/release/obscura
           retention-days: 7

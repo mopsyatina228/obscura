@@ -57,6 +57,7 @@ integration_tests!(
     input_mouse_label_activation,
     js_fetch_emits_network_events,
     legacy_table_apis,
+    native_submit_event_trust,
     lifecycle_replay,
     max_connections_cap,
     module_network_events,
