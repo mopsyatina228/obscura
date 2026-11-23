@@ -12666,7 +12666,7 @@ function _isFormBlob(v) {
     (v._bytes !== undefined || (typeof Blob === "function" && v instanceof Blob));
 }
 if (typeof FormData === "undefined") globalThis.FormData = class FormData {
-  constructor(form) {
+  constructor(form, submitter) {
     this._d = [];
     // `new FormData(form)` reads the form's current successful controls (the
     // spec's "constructing the entry list"): skip disabled controls, buttons,
@@ -12675,6 +12675,20 @@ if (typeof FormData === "undefined") globalThis.FormData = class FormData {
     const isForm = form.nodeType === 1 && String(form.tagName || "").toUpperCase() === "FORM";
     if (!isForm) {
       throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+    }
+    // HTML FormData(form, submitter) is used by React Router to distinguish
+    // which submit button was clicked. Without the button's name/value entry,
+    // <button name="intent" value="resend"> and "continue" look identical.
+    if (submitter != null) {
+      if (!_isSubmitButton(submitter)) {
+        throw new TypeError("Failed to construct 'FormData': the submitter is not a submit button.");
+      }
+      if (submitter.form !== form) {
+        throw new DOMException(
+          "Failed to construct 'FormData': the submitter is not owned by the given form.",
+          "NotFoundError"
+        );
+      }
     }
     if (typeof form.querySelectorAll === "function") {
       const controls = form.querySelectorAll("input,select,textarea");
@@ -12690,6 +12704,17 @@ if (typeof FormData === "undefined") globalThis.FormData = class FormData {
         }
         if (type === "submit" || type === "reset" || type === "button" || type === "image" || type === "file") continue;
         this._d.push([name, el.value != null ? String(el.value) : ""]);
+      }
+    }
+    if (submitter != null && !submitter.disabled) {
+      const name = submitter.getAttribute ? submitter.getAttribute("name") : submitter.name;
+      if (name) {
+        const type = ((submitter.getAttribute && submitter.getAttribute("type")) || submitter.type || "").toLowerCase();
+        if (type === "image") {
+          this._d.push([name + ".x", "0"], [name + ".y", "0"]);
+        } else {
+          this._d.push([name, submitter.value != null ? String(submitter.value) : ""]);
+        }
       }
     }
   }
