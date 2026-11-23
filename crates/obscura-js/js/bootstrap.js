@@ -9608,6 +9608,74 @@ if (typeof Response === 'undefined') {
     async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
     async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
     async blob() { this._consumeBody(); return new Blob([this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    // Fetch Body mixin. A Response may carry urlencoded or multipart form data,
+    // independently of Request.formData(), as used by modern web frameworks.
+    async formData() {
+      this._consumeBody();
+      const bytes = this._streamSource ? await _readResponseStream(this._streamSource)
+        : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes;
+      const contentType = this.headers.get('content-type') || '';
+      const output = new FormData();
+      if (/^\s*application\/x-www-form-urlencoded(?:\s*;|$)/i.test(contentType)) {
+        for (const [name, value] of new URLSearchParams(_decodeBodyWithCharset(bytes, this.headers))) {
+          output.append(name, value);
+        }
+        return output;
+      }
+      if (!/^\s*multipart\/form-data(?:\s*;|$)/i.test(contentType)) {
+        throw new TypeError('Could not parse Response body as FormData: unsupported Content-Type');
+      }
+      const match = /(?:^|;)\s*boundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+      const boundary = match && (match[1] || match[2]);
+      if (!boundary) throw new TypeError('Could not parse Response body as FormData: missing boundary');
+      const encode = value => new TextEncoder().encode(value);
+      const marker = encode('--' + boundary);
+      const separator = encode('\r\n\r\n');
+      const delimiter = encode('\r\n--' + boundary);
+      const findBytes = (needle, from) => {
+        for (let i = from; i <= bytes.length - needle.length; i++) {
+          let match = true;
+          for (let j = 0; j < needle.length; j++) {
+            if (bytes[i + j] !== needle[j]) { match = false; break; }
+          }
+          if (match) return i;
+        }
+        return -1;
+      };
+      let pos = findBytes(marker, 0);
+      if (pos < 0) throw new TypeError('Could not parse Response body as FormData: boundary not found');
+      while (pos >= 0) {
+        pos += marker.length;
+        if (bytes[pos] === 45 && bytes[pos + 1] === 45) return output;
+        if (bytes[pos] !== 13 || bytes[pos + 1] !== 10) {
+          throw new TypeError('Could not parse Response body as FormData: invalid part');
+        }
+        pos += 2;
+        const headerEnd = findBytes(separator, pos);
+        if (headerEnd < 0) throw new TypeError('Could not parse Response body as FormData: missing header terminator');
+        const headerText = new TextDecoder().decode(bytes.subarray(pos, headerEnd));
+        const disposition = /(?:^|\r\n)content-disposition:\s*([^\r\n]+)/i.exec(headerText);
+        if (!disposition || !/^\s*form-data\s*(?:;|$)/i.test(disposition[1])) {
+          throw new TypeError('Could not parse Response body as FormData: invalid disposition');
+        }
+        const name = /(?:^|;)\s*name="([^"]*)"/i.exec(disposition[1]);
+        const filename = /(?:^|;)\s*filename="([^"]*)"/i.exec(disposition[1]);
+        const dataStart = headerEnd + separator.length;
+        const dataEnd = findBytes(delimiter, dataStart);
+        if (dataEnd < 0) throw new TypeError('Could not parse Response body as FormData: missing closing delimiter');
+        if (name) {
+          const payload = bytes.slice(dataStart, dataEnd);
+          if (filename) {
+            const mime = /(?:^|\r\n)content-type:\s*([^\r\n]+)/i.exec(headerText);
+            output.append(name[1], new File([payload], filename[1], { type: mime ? mime[1].trim() : 'application/octet-stream' }));
+          } else {
+            output.append(name[1], new TextDecoder().decode(payload));
+          }
+        }
+        pos = dataEnd + 2;
+      }
+      throw new TypeError('Could not parse Response body as FormData');
+    }
     clone() {
       if (this.bodyUsed || this._streamSource?.locked || this._bodyStream?.locked) throw new TypeError('Body is already consumed or locked');
       if (this._streamSource) {
