@@ -37,6 +37,10 @@ jobs:
           cargo test --locked -p obscura-js fetch_pull_resource_releases_chunk_before_eof -- --nocapture
           cargo test --locked -p obscura-js fetch_pull_resource_rejects_cumulative_oversize -- --nocapture
           cargo test --locked -p obscura-js fetch_pull_resource_cancels_pending_read -- --nocapture
+      - name: Verify real EventSource parser and reconnect behavior
+        run: |
+          node --check crates/obscura-js/js/bootstrap.js
+          node --test crates/obscura-js/tests/eventsource_live.test.cjs
       - name: Verify native SSE ReadableStream bridge conformance
         run: |
           node --check crates/obscura-js/js/bootstrap.js

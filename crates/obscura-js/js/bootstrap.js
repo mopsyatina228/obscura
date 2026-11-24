@@ -19052,7 +19052,7 @@ function _makeListenerBox(self) {
 // Incremental UTF-8 SSE field framing, independent of the network transport.
 // Intentionally NOT wired into the current EventSource shim yet: HTTP body
 // delivery is still all-at-once. Do not simulate streaming with response.text().
-function _createSseEventParser(onMessage, onRetry = () => {}) {
+function _createSseEventParser(onMessage, onRetry = () => {}, initialLastEventId = '') {
   if (typeof onMessage !== 'function' || typeof onRetry !== 'function') {
     throw new TypeError('SSE parser callbacks must be functions');
   }
@@ -19060,7 +19060,7 @@ function _createSseEventParser(onMessage, onRetry = () => {}) {
   const MAX_LINE = 256 * 1024;
   const MAX_EVENT = 1024 * 1024;
   let line = '', data = [], dataLength = 0, eventType = '';
-  let lastEventId = '', first = true, skipLF = false, closed = false;
+  let lastEventId = String(initialLastEventId), first = true, skipLF = false, closed = false;
   const lineDone = () => {
     const fieldLine = line;
     line = '';
@@ -19137,26 +19137,138 @@ function _createSseEventParser(onMessage, onRetry = () => {}) {
 }
 // OBMAIN89_SSE_PARSER_END
 
+// OBMAIN95_EVENTSOURCE_BEGIN
+// Real EventSource atop the already tested incremental native HTTP SSE fetch.
+// No third-party URL rewriting, synthetic open, or response.text() buffering.
 if (typeof EventSource === 'undefined') {
   globalThis.EventSource = class EventSource {
-    constructor(url, init) {
-      this.url = url;
-      this.readyState = 0; // CONNECTING
+    constructor(url, init = {}) {
+      if (arguments.length === 0) throw new TypeError("EventSource requires a URL");
+      const parsed = new URL(String(url), document.baseURI);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new DOMException("EventSource URL must use HTTP(S)", "SyntaxError");
+      }
+      this.url = parsed.href;
       this.withCredentials = !!(init && init.withCredentials);
+      this.readyState = 0;
       this.onopen = null; this.onmessage = null; this.onerror = null;
+      this._esLastEventId = '';
+      this._esRetry = 3000;
+      this._esTimer = null;
+      this._esAbort = null;
+      this._esReader = null;
+      this._esEpoch = 0;
       _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      // Deliberately defer the first request; close() before this task
+      // must not issue an HTTP GET.
+      Promise.resolve().then(() => this._esConnect());
     }
-    close() { this.readyState = 2; }
+    _esEmit(event) {
+      const handler = this['on' + event.type];
+      if (typeof handler === 'function') {
+        try { handler.call(this, event); } catch (_) {}
+      }
+      try { this.dispatchEvent(event); } catch (_) {}
+    }
+    _esRetryLater() {
+      if (this.readyState === 2) return;
+      this.readyState = 0;
+      this._esEmit(new Event('error'));
+      if (this.readyState === 2) return;
+      // Bound reconnect storms even if the server asks for retry:0.
+      const wait = Math.min(60000, Math.max(250, this._esRetry));
+      this._esTimer = setTimeout(() => {
+        this._esTimer = null;
+        this._esConnect();
+      }, wait);
+    }
+    _esStop() {
+      this.readyState = 2;
+      this._esEpoch++;
+      if (this._esTimer !== null) { clearTimeout(this._esTimer); this._esTimer = null; }
+      if (this._esAbort) { this._esAbort.abort(); this._esAbort = null; }
+      const reader = this._esReader;
+      this._esReader = null;
+      if (reader) {
+        Promise.resolve(reader.cancel()).catch(() => {});
+      }
+    }
+    async _esConnect() {
+      if (this.readyState === 2) return;
+      const epoch = ++this._esEpoch;
+      const controller = new AbortController();
+      this._esAbort = controller;
+      let reader = null, parser = null;
+      let fatal = false;
+      try {
+        const headers = { Accept: 'text/event-stream' };
+        if (this._esLastEventId) headers['Last-Event-ID'] = this._esLastEventId;
+        const response = await fetch(this.url, {
+          method: 'GET', headers, mode: 'cors',
+          credentials: this.withCredentials ? 'include' : 'same-origin',
+          cache: 'no-store', signal: controller.signal,
+        });
+        if (this.readyState === 2 || epoch !== this._esEpoch) return;
+        const contentType = response.headers.get('content-type') || '';
+        // HTTP 204 explicitly stops reconnecting; an invalid 200 response
+        // must not be reported as an opened event stream.
+        if (response.status === 204
+            || response.status !== 200
+            || !/^text\/event-stream(?:\s*;|$)/i.test(contentType)) {
+          fatal = true;
+          return;
+        }
+        if (!response.body) { fatal = true; return; }
+        reader = response.body.getReader();
+        this._esReader = reader;
+        parser = _createSseEventParser(
+          msg => {
+            if (this.readyState !== 1 || epoch !== this._esEpoch) return;
+            this._esLastEventId = msg.lastEventId;
+            const event = new MessageEvent(msg.type, {
+              data: msg.data, origin: new URL(this.url).origin,
+              lastEventId: msg.lastEventId,
+            });
+            this._esEmit(event);
+          },
+          retry => { this._esRetry = retry; },
+          this._esLastEventId
+        );
+        this.readyState = 1;
+        this._esEmit(new Event('open'));
+        while (this.readyState === 1 && epoch === this._esEpoch) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          parser.push(value);
+          this._esLastEventId = parser.lastEventId;
+        }
+        if (epoch === this._esEpoch && this.readyState !== 2) {
+          parser.finish();
+          this._esLastEventId = parser.lastEventId;
+        }
+      } catch (error) {
+        // Aborts caused by close() are deliberately silent.
+        if (this.readyState === 2 || epoch !== this._esEpoch) return;
+      } finally {
+        if (reader) {
+          if (this._esReader === reader) this._esReader = null;
+          try { reader.releaseLock(); } catch (_) {}
+        }
+        if (this._esAbort === controller) this._esAbort = null;
+        // Cancelling an unread/non-200 body prevents a dangling native RID.
+        if (fatal && this.readyState !== 2) {
+          this._esStop();
+          this._esEmit(new Event('error'));
+        } else if (epoch === this._esEpoch && this.readyState !== 2) {
+          this._esRetryLater();
+        }
+      }
+    }
+    close() { if (this.readyState !== 2) this._esStop(); }
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
   };
 }
+// OBMAIN95_EVENTSOURCE_END
 
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
