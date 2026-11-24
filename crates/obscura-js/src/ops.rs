@@ -1068,10 +1068,18 @@ fn fetch_max_body_bytes() -> usize {
 /// both when the server advertises an oversized `Content-Length` and when the
 /// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
 /// a multi-GB response from ever being fully allocated.
-async fn read_body_capped(
+// The callback runs as soon as each bounded transport chunk is received,
+// while the socket may still be open.  The ordinary buffered fetch path uses
+// the no-op callback and remains behaviorally unchanged.  Future consumer
+// resources will pull chunks with backpressure instead of calling text().
+async fn read_body_capped_with_chunks<F>(
     mut response: reqwest::Response,
     max: usize,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    mut on_chunk: F,
+) -> Result<Vec<u8>, deno_error::JsErrorBox>
+where
+    F: FnMut(&[u8]) -> Result<(), deno_error::JsErrorBox>,
+{
     if let Some(len) = response.content_length() {
         if len > max as u64 {
             return Err(deno_error::JsErrorBox::generic(format!(
@@ -1090,9 +1098,20 @@ async fn read_body_capped(
                 "response body exceeds the maximum of {max} bytes"
             )));
         }
+        // Reject an oversized chunk before notifying the consumer: callers
+        // cannot accidentally forward bytes that violated the configured cap.
+        on_chunk(&chunk)?;
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+// Compatibility entry point: existing callers still receive the full body.
+async fn read_body_capped(
+    response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    read_body_capped_with_chunks(response, max, |_| Ok(())).await
 }
 
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
@@ -6166,6 +6185,68 @@ mod tests {
             err.to_string().contains("maximum"),
             "error should mention the cap: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_delivers_chunks_before_end_of_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        // The second half cannot be sent until the client callback has fired.
+        // A regression to buffering until EOF necessarily times out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let first = b"data: first\n\n";
+        let second = b"data: second\n\n";
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                first.len() + second.len()
+            );
+            sock.write_all(headers.as_bytes()).await.unwrap();
+            sock.write_all(first).await.unwrap();
+            release_rx.await.expect("client must release the withheld second chunk");
+            sock.write_all(second).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send().await.expect("fixture request");
+        let (observed_tx, observed_rx) = oneshot::channel::<Vec<u8>>();
+        let mut observed_tx = Some(observed_tx);
+        let reader = read_body_capped_with_chunks(resp, 1024, move |chunk| {
+            if let Some(tx) = observed_tx.take() {
+                let _ = tx.send(chunk.to_vec());
+            }
+            Ok(())
+        });
+        let controller = async move {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(4), observed_rx,
+            ).await.expect("chunk callback must fire before server EOF")
+                .expect("chunk callback sender");
+            assert_eq!(chunk, first);
+            release_tx.send(()).unwrap();
+        };
+        let (read_result, ()) = tokio::join!(reader, controller);
+        assert_eq!(read_result.unwrap(), [first.as_slice(), second.as_slice()].concat());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_never_forwards_over_limit_chunk() {
+        let addr = serve_body_once(4096, false).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/")).send().await.unwrap();
+        let mut forwarded = 0usize;
+        let result = read_body_capped_with_chunks(resp, 128, |chunk| {
+            forwarded += chunk.len();
+            Ok(())
+        }).await;
+        assert!(result.is_err());
+        assert!(forwarded <= 128, "oversized bytes must not enter the callback");
     }
 
     #[tokio::test]

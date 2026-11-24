@@ -30,6 +30,10 @@ jobs:
         run: |
           node --check crates/obscura-js/js/bootstrap.js
           node --test crates/obscura-js/tests/sse_parser.test.cjs
+      - name: Verify bounded HTTP chunk reader callbacks
+        run: |
+          cargo test --locked -p obscura-js read_body_capped_delivers_chunks_before_end_of_response -- --nocapture
+          cargo test --locked -p obscura-js read_body_capped_never_forwards_over_limit_chunk -- --nocapture
       - name: Run submit event and email regression tests
         run: cargo test --locked -p obscura-cdp --test integration submit_event_email_conformance -- --nocapture
       - name: Run submitter FormData regressions
