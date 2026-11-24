@@ -34,6 +34,9 @@ jobs:
         run: |
           cargo test --locked -p obscura-js read_body_capped_delivers_chunks_before_end_of_response -- --nocapture
           cargo test --locked -p obscura-js read_body_capped_never_forwards_over_limit_chunk -- --nocapture
+          cargo test --locked -p obscura-js fetch_pull_resource_releases_chunk_before_eof -- --nocapture
+          cargo test --locked -p obscura-js fetch_pull_resource_rejects_cumulative_oversize -- --nocapture
+          cargo test --locked -p obscura-js fetch_pull_resource_cancels_pending_read -- --nocapture
       - name: Run submit event and email regression tests
         run: cargo test --locked -p obscura-cdp --test integration submit_event_email_conformance -- --nocapture
       - name: Run submitter FormData regressions

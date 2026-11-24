@@ -1210,6 +1210,100 @@ async fn op_fetch_body(
     result?.map(|bytes| if resource.opaque { Vec::new() } else { bytes })
 }
 
+// OBMAIN92: demand-driven bounded HTTP body. Exactly one transport read
+// per consumer pull; no task or buffer is created behind the consumer.
+// The current public fetch API deliberately remains unchanged.
+struct FetchChunkPullResource {
+    response: RefCell<Option<reqwest::Response>>,
+    cancel: Rc<CancelHandle>,
+    remaining: Cell<usize>,
+    ended: Cell<bool>,
+}
+impl FetchChunkPullResource {
+    fn new(
+        response: reqwest::Response, max_bytes: usize, cancel: Rc<CancelHandle>,
+    ) -> Result<Self, deno_error::JsErrorBox> {
+        if response.content_length().is_some_and(|n| n > max_bytes as u64) {
+            return Err(deno_error::JsErrorBox::generic(
+                "Response Content-Length exceeds stream byte limit",
+            ));
+        }
+        Ok(Self {
+            response: RefCell::new(Some(response)), cancel,
+            remaining: Cell::new(max_bytes), ended: Cell::new(false),
+        })
+    }
+    async fn pull(&self) -> Result<Option<Vec<u8>>, deno_error::JsErrorBox> {
+        if self.ended.get() { return Ok(None); }
+        let mut response = self.response.borrow_mut().take().ok_or_else(|| {
+            deno_error::JsErrorBox::type_error("Response stream already has a pending read")
+        })?;
+        loop {
+            let part = match response.chunk().or_cancel(self.cancel.clone()).await {
+                Ok(Ok(part)) => part,
+                Ok(Err(error)) => {
+                    self.ended.set(true);
+                    return Err(deno_error::JsErrorBox::generic(error.to_string()));
+                }
+                Err(_) => {
+                    self.ended.set(true);
+                    return Err(deno_error::JsErrorBox::generic("Response stream was cancelled"));
+                }
+            };
+            match part {
+                None => {
+                    self.ended.set(true);
+                    return Ok(None);
+                }
+                Some(bytes) if bytes.is_empty() => continue,
+                Some(bytes) => {
+                    let remaining = self.remaining.get();
+                    if bytes.len() > remaining {
+                        self.ended.set(true);
+                        return Err(deno_error::JsErrorBox::generic(
+                            "Response stream exceeds maximum bytes",
+                        ));
+                    }
+                    if self.cancel.is_canceled() {
+                        self.ended.set(true);
+                        return Err(deno_error::JsErrorBox::generic(
+                            "Response stream was cancelled",
+                        ));
+                    }
+                    self.remaining.set(remaining - bytes.len());
+                    // One response is available to exactly one pending reader.
+                    self.response.borrow_mut().replace(response);
+                    return Ok(Some(bytes.to_vec()));
+                }
+            }
+        }
+    }
+}
+impl Resource for FetchChunkPullResource {
+    fn close(self: Rc<Self>) {
+        self.cancel.cancel();
+        self.ended.set(true);
+        self.response.borrow_mut().take();
+    }
+}
+// Internal op: zero bytes means EOF. No producer or unbounded buffering.
+// The existing fetch body resource is not replaced in this iteration.
+#[op2]
+#[buffer]
+async fn op_fetch_stream_next(
+    state: Rc<RefCell<OpState>>, rid: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resource = state.borrow().resource_table.get::<FetchChunkPullResource>(rid)
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let result = resource.pull().await;
+    if !matches!(result, Ok(Some(_))) {
+        if let Ok(owned) = state.borrow_mut().resource_table.take_any(rid) {
+            owned.close();
+        }
+    }
+    result.map(|part| part.unwrap_or_default())
+}
+
 async fn fetch_body_result(
     state: &RefCell<OpState>,
     mut metadata: serde_json::Value,
@@ -6187,6 +6281,97 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_pull_resource_releases_chunk_before_eof() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, pending) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let first = b"data: first\n\n";
+            let second = b"data: second\n\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                first.len() + second.len()
+            );
+            sock.write_all(header.as_bytes()).await.unwrap();
+            sock.write_all(first).await.unwrap();
+            pending.await.unwrap();
+            sock.write_all(second).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/")).send().await.unwrap();
+        let reader = super::FetchChunkPullResource::new(
+            response, 1024, deno_core::CancelHandle::new_rc()
+        ).unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(3), reader.pull()
+        ).await.expect("must receive first chunk before server EOF").unwrap().unwrap();
+        assert_eq!(first, b"data: first\n\n");
+        release.send(()).unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(3), reader.pull()
+        ).await.unwrap().unwrap().unwrap();
+        assert_eq!(second, b"data: second\n\n");
+        assert!(reader.pull().await.unwrap().is_none());
+        assert!(reader.pull().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_pull_resource_rejects_cumulative_oversize() {
+        let addr = serve_body_once(8192, false).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/")).send().await.unwrap();
+        let reader = super::FetchChunkPullResource::new(
+            response, 256, deno_core::CancelHandle::new_rc()
+        ).unwrap();
+        let mut total = 0usize;
+        let err = loop {
+            match reader.pull().await {
+                Ok(Some(chunk)) => { total += chunk.len(); assert!(total <= 256); }
+                Err(err) => break err,
+                Ok(None) => panic!("oversize stream must fail"),
+            }
+        };
+        assert!(err.to_string().contains("maximum"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_pull_resource_cancels_pending_read() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, pending) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            pending.await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/")).send().await.unwrap();
+        let cancel = deno_core::CancelHandle::new_rc();
+        let reader = std::rc::Rc::new(
+            super::FetchChunkPullResource::new(response, 1024, cancel.clone()).unwrap()
+        );
+        let read_handle = reader.clone();
+        let (r, ()) = tokio::join!(
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3), read_handle.pull()
+                ).await.expect("cancel must interrupt pending read")
+            },
+            async move { tokio::task::yield_now().await; cancel.cancel(); }
+        );
+        assert!(r.unwrap_err().to_string().contains("cancelled"));
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn read_body_capped_delivers_chunks_before_end_of_response() {
         use tokio::io::AsyncWriteExt;
@@ -8817,6 +9002,7 @@ pub fn build_extension() -> Extension {
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),
+        op_fetch_stream_next(),
         op_get_cookies(),
         op_set_cookie(),
         op_storage_access(),
