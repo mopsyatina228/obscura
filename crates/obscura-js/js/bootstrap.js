@@ -9048,7 +9048,13 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
       signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType);
   } catch (error) {
     cleanup();
-    throw signalState && signalState.aborted ? signalState.reason : error;
+    if (signalState && signalState.aborted) throw signalState.reason;
+    // Fetch rejects transport/network errors with TypeError, not the native
+    // operation's generic Error. Keep internal callers' error identity intact.
+    if (resourceType === "Fetch" && !(error instanceof TypeError)) {
+      throw new TypeError(error instanceof Error ? error.message : String(error));
+    }
+    throw error;
   }
   if (signalState && signalState.aborted) { cleanup(); throw signalState.reason; }
   const parsed = JSON.parse(raw);
