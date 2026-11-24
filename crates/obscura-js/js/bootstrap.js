@@ -18997,6 +18997,95 @@ function _makeListenerBox(self) {
   };
 }
 
+// OBMAIN89_SSE_PARSER_BEGIN
+// Incremental UTF-8 SSE field framing, independent of the network transport.
+// Intentionally NOT wired into the current EventSource shim yet: HTTP body
+// delivery is still all-at-once. Do not simulate streaming with response.text().
+function _createSseEventParser(onMessage, onRetry = () => {}) {
+  if (typeof onMessage !== 'function' || typeof onRetry !== 'function') {
+    throw new TypeError('SSE parser callbacks must be functions');
+  }
+  const decoder = new TextDecoder('utf-8');
+  const MAX_LINE = 256 * 1024;
+  const MAX_EVENT = 1024 * 1024;
+  let line = '', data = [], dataLength = 0, eventType = '';
+  let lastEventId = '', first = true, skipLF = false, closed = false;
+  const lineDone = () => {
+    const fieldLine = line;
+    line = '';
+    if (fieldLine === '') {
+      if (data.length) onMessage({
+        type: eventType || 'message',
+        data: data.join('\n'),
+        lastEventId,
+      });
+      data = [];
+      dataLength = 0;
+      eventType = '';
+      return;
+    }
+    if (fieldLine[0] === ':') return;
+    const colon = fieldLine.indexOf(':');
+    const field = colon < 0 ? fieldLine : fieldLine.slice(0, colon);
+    let value = colon < 0 ? '' : fieldLine.slice(colon + 1);
+    if (value[0] === ' ') value = value.slice(1);
+    switch (field) {
+      case 'data':
+        dataLength += value.length + 1;
+        if (dataLength > MAX_EVENT) throw new RangeError('SSE event exceeds maximum size');
+        data.push(value);
+        break;
+      case 'event': eventType = value; break;
+      case 'id':
+        if (!value.includes('\0')) lastEventId = value;
+        break;
+      case 'retry':
+        if (/^[0-9]+$/.test(value)) {
+          const ms = Number(value);
+          if (Number.isSafeInteger(ms)) onRetry(ms);
+        }
+        break;
+    }
+  };
+  const ingest = (text) => {
+    if (closed) throw new TypeError('SSE parser is closed');
+    if (first && text.length) {
+      first = false;
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    }
+    for (const c of text) {
+      if (skipLF) {
+        skipLF = false;
+        if (c === '\n') continue;
+      }
+      if (c === '\r') { lineDone(); skipLF = true; }
+      else if (c === '\n') lineDone();
+      else {
+        line += c;
+        if (line.length > MAX_LINE) throw new RangeError('SSE line exceeds maximum size');
+      }
+    }
+  };
+  return {
+    push(chunk) {
+      if (closed) throw new TypeError('SSE parser is closed');
+      if (typeof chunk === 'string') ingest(chunk);
+      else ingest(decoder.decode(chunk, { stream: true }));
+    },
+    get lastEventId() { return lastEventId; },
+    finish() {
+      if (closed) return;
+      ingest(decoder.decode());
+      // The SSE processing model discards any un-terminated pending event at EOF.
+      closed = true;
+      data = [];
+      line = '';
+    },
+    cancel() { closed = true; data = []; line = ''; },
+  };
+}
+// OBMAIN89_SSE_PARSER_END
+
 if (typeof EventSource === 'undefined') {
   globalThis.EventSource = class EventSource {
     constructor(url, init) {
