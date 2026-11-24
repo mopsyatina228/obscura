@@ -2612,14 +2612,73 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
-                        Ok(resp) => Some((idx, url, resp)),
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch script {}: {}", url, e);
-                            None
+                    // An external classic <script src> is fetched with GET.
+                    // Retry only transport failures (not HTTP statuses, CORS,
+                    // security blocking or redirects), as for ES modules.
+                    // Keep retries inside the existing page-wide deadline;
+                    // execute the resulting body only once after this loop.
+                    let mut retries = 0usize;
+                    loop {
+                        if tokio::time::Instant::now() >= script_deadline {
+                            tracing::warn!(
+                                "Classic script GET deadline reached: path={}",
+                                parsed.path()
+                            );
+                            break None;
+                        }
+                        let result = tokio::time::timeout_at(
+                            script_deadline,
+                            client.fetch_resource_with_callbacks(
+                                &parsed,
+                                request.clone(),
+                                Some(&cbs),
+                            ),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(resp)) => break Some((idx, url, resp)),
+                            Ok(Err(obscura_net::ObscuraNetError::Network(_)))
+                                if retries < 2 =>
+                            {
+                                retries += 1;
+                                tracing::debug!(
+                                    "Transient classic script GET failure: path={} retry={}/2",
+                                    parsed.path(),
+                                    retries
+                                );
+                                if tokio::time::timeout_at(
+                                    script_deadline,
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                                        60 * retries as u64,
+                                    )),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break None;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "Classic script GET failed: path={} class={}",
+                                    parsed.path(),
+                                    match e {
+                                        obscura_net::ObscuraNetError::Network(_) => "network",
+                                        obscura_net::ObscuraNetError::Cors(_) => "cors",
+                                        obscura_net::ObscuraNetError::Blocked(_) => "blocked",
+                                        obscura_net::ObscuraNetError::TooManyRedirects(_) => "redirect",
+                                        obscura_net::ObscuraNetError::ResponseTooLarge { .. } => "too-large",
+                                    }
+                                );
+                                break None;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Classic script GET deadline reached: path={}",
+                                    parsed.path()
+                                );
+                                break None;
+                            }
                         }
                     }
                 }
@@ -7533,6 +7592,125 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    // Local-only deterministic fixture: first N classic JS requests lose their
+    // TCP connection before receiving any response. HTTP status responses are
+    // deliberately separate, because they must never enter the retry path.
+    fn spawn_classic_script_transport_fixture(
+        dropped_requests: usize,
+        script_status: u16,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_secs(10) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buffer = [0u8; 2048];
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, content_type, body) = if path == "/page.html" {
+                    (
+                        "200 OK",
+                        "text/html",
+                        "<!doctype html><script>globalThis.__classicRuns=0;</script><script src='/classic.js'></script>",
+                    )
+                } else if path == "/classic.js" {
+                    let current = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                    if current <= dropped_requests {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    (
+                        if script_status == 503 {
+                            "503 Service Unavailable"
+                        } else {
+                            "200 OK"
+                        },
+                        "application/javascript",
+                        "globalThis.__classicRuns=(globalThis.__classicRuns||0)+1;",
+                    )
+                } else {
+                    ("404 Not Found", "text/plain", "not found")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}/page.html"), requests)
+    }
+
+    async fn check_classic_script_transport_case(
+        label: &str,
+        dropped_requests: usize,
+        script_status: u16,
+        expected_requests: usize,
+        expected_executions: f64,
+    ) {
+        use std::sync::atomic::Ordering;
+        let (url, script_requests) =
+            spawn_classic_script_transport_fixture(dropped_requests, script_status);
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            label.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(label.to_string(), context);
+        tokio::time::timeout(std::time::Duration::from_secs(8), page.navigate(&url))
+            .await
+            .expect("classic-script navigation deadline")
+            .expect("local dummy HTML load");
+        assert_eq!(
+            script_requests.load(Ordering::SeqCst),
+            expected_requests,
+            "{label}: unexpected GET retries",
+        );
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__classicRuns").unwrap(),
+            serde_json::json!(expected_executions),
+            "{label}: script executed unexpectedly or more than once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_script_transient_get_retries_once_without_double_execution() {
+        check_classic_script_transport_case("classic-fault-once", 1, 200, 2, 1.0).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_script_persistent_transport_failure_stops_after_two_retries() {
+        check_classic_script_transport_case("classic-always-fault", 4, 200, 3, 0.0).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classic_script_http503_does_not_retry_or_execute() {
+        check_classic_script_transport_case("classic-http503", 0, 503, 1, 0.0).await;
     }
 
     /// Issue #678: `localStorage` belongs to the BrowserContext and

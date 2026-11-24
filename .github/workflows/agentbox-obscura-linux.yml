@@ -34,6 +34,12 @@ jobs:
         run: cargo test --locked -p obscura-cdp --test integration request_formdata_conformance -- --nocapture
       - name: Test slow module graph on unmounted SPA shell
         run: cargo test --locked -p obscura-browser populated_shell_without_form_controls_allows_slow_module_graph -- --nocapture
+      - name: Verify classic script bounded transport retries
+        # Keep V8 tests in separate processes rather than sharing isolates.
+        run: |
+          cargo test --locked -p obscura-browser classic_script_transient_get_retries_once_without_double_execution -- --nocapture
+          cargo test --locked -p obscura-browser classic_script_persistent_transport_failure_stops_after_two_retries -- --nocapture
+          cargo test --locked -p obscura-browser classic_script_http503_does_not_retry_or_execute -- --nocapture
       - name: Verify trusted native form submit parity
         run: cargo test --locked -p obscura-cdp --features render --test integration native_submit_event_trust -- --nocapture
       - name: Verify Response.formData compatibility
