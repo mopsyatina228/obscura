@@ -26,10 +26,44 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
     format!(
         "(function() {{\
             var t = document.activeElement;\
-            if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (!t) return;\
+            var ins = {text};\
+            if (t.localName !== 'input' && t.localName !== 'textarea') {{\
+                var editable = function(n) {{\
+                    if (n && n.nodeType !== 1) n = n.parentElement;\
+                    while (n) {{\
+                        var a = n.getAttribute('contenteditable');\
+                        if (a !== null) {{\
+                            a = a.toLowerCase();\
+                            if (a === 'false') return false;\
+                            if (a === '' || a === 'true' || a === 'plaintext-only') return true;\
+                        }}\
+                        n = n.parentElement;\
+                    }}\
+                    return false;\
+                }};\
+                if (!editable(t)) return;\
+                while (t.parentElement && editable(t.parentElement)) t = t.parentElement;\
+                var doc = t.ownerDocument;\
+                var sel = doc.getSelection();\
+                var inside = function(n) {{ return !!n && (n === t || t.contains(n)) && editable(n); }};\
+                var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
+                if (!t.dispatchEvent(before) || !editable(t) || !t.isConnected) return;\
+                var r = sel && sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;\
+                if (!r || !inside(r.startContainer) || !inside(r.endContainer)) {{\
+                    r = doc.createRange(); r.selectNodeContents(t); r.collapse(false);\
+                }}\
+                if (!r.collapsed) {{\
+                    r.deleteContents(); r.collapse(true);\
+                }}\
+                var node = doc.createTextNode(ins);\
+                r.insertNode(node);\
+                if (sel) sel.collapse(node, ins.length);\
+                t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
+                return;\
+            }}\
             if (globalThis.__obscura_isDisabled(t)) return;\
             if (!{ime_commit} && t.hasAttribute('readonly')) return;\
-            var ins = {text};\
             var commitStart = {ime_commit} ? t.selectionStart : null;\
             if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
             var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\

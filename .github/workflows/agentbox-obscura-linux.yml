@@ -42,6 +42,15 @@ jobs:
         run: cargo test --locked -p obscura-js retry_policy_tests -- --nocapture
       - name: Verify existing module network events
         run: cargo test --locked -p obscura-cdp --test integration module_network_events -- --nocapture
+      - name: Verify editable text insertion and field editing regressions
+        # One named V8 test per invocation. Cargo test's default multi-test process
+        # incorrectly shares the native V8 isolate across these fixtures.
+        run: |
+          cargo test --locked -p obscura-cdp --test integration textarea_enter_selection::insert_text_contenteditable_replaces_selection_and_respects_cancellation -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration textarea_enter_selection::insert_text_contenteditable_does_not_replace_selection_outside_host -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration textarea_enter_selection::insert_text_contenteditable_unicode_utf16_caret_and_nested_markup -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration textarea_enter_selection::text_insertion_dispatches_cancelable_beforeinput_and_trusted_input_events -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration textarea_enter_selection::canceled_or_readonly_text_insertion_preserves_value_and_selection -- --exact --nocapture
       - name: Build render-enabled Obscura binary
         run: cargo build --locked --release -p obscura-cli --bins --features render
       - name: Verify binary and fingerprint

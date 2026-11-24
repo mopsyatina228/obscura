@@ -250,3 +250,64 @@ async fn text_insertion_reads_value_and_selection_after_beforeinput_handlers() {
         assert_eq!(result["end"], caret, "{method}");
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_contenteditable_replaces_selection_and_respects_cancellation() {
+    let mut ctx = setup().await;
+    evaluate(&mut ctx, r#"document.body.innerHTML = '<div id="editor" contenteditable="true"><b>abcd</b></div>'; var editor = document.getElementById('editor'); editor.focus(); globalThis.edEvents = []; for (const type of ['beforeinput','input']) editor.addEventListener(type, e => edEvents.push([type,e.data,e.inputType,e.cancelable])); const s = document.getSelection(); s.setBaseAndExtent(editor.firstChild.firstChild,1,editor.firstChild.firstChild,3);"#).await;
+    assert_eq!(evaluate(&mut ctx, "document.activeElement.id").await, "editor", "fixture must focus editing host");
+    cdp(&mut ctx, "Input.insertText", json!({"text":"Z"})).await;
+    let v = evaluate(&mut ctx, "JSON.stringify({text:editor.textContent,bold:editor.firstChild.localName,events:edEvents,caret:document.getSelection().anchorOffset})").await;
+    let result: Value = serde_json::from_str(v.as_str().unwrap()).unwrap();
+    assert_eq!(result["text"], "aZd");
+    assert_eq!(result["bold"], "b");
+    assert_eq!(result["caret"], 1);
+    assert_eq!(result["events"], json!([["beforeinput","Z","insertText",true],["input","Z","insertText",false]]));
+    evaluate(&mut ctx, "editor.addEventListener('beforeinput', e => e.preventDefault(), {once:true}); edEvents.length=0;").await;
+    cdp(&mut ctx, "Input.insertText", json!({"text":"Q"})).await;
+    assert_eq!(evaluate(&mut ctx, "editor.textContent").await, "aZd");
+    assert_eq!(evaluate(&mut ctx, "edEvents.length").await, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_contenteditable_does_not_replace_selection_outside_host() {
+    let mut ctx = setup().await;
+    evaluate(&mut ctx, r#"document.body.innerHTML = '<p id="outside">keep</p><div id="editor" contenteditable="plaintext-only"></div>'; var editor = document.getElementById('editor'); var outside = document.getElementById('outside'); editor.focus(); document.getSelection().selectAllChildren(outside);"#).await;
+    assert_eq!(evaluate(&mut ctx, "document.activeElement.id").await, "editor", "fixture must focus editing host");
+    cdp(&mut ctx, "Input.insertText", json!({"text":"hello"})).await;
+    assert_eq!(evaluate(&mut ctx, "outside.textContent").await, "keep");
+    assert_eq!(evaluate(&mut ctx, "editor.textContent").await, "hello");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_contenteditable_unicode_utf16_caret_and_nested_markup() {
+    let mut ctx = setup().await;
+    evaluate(&mut ctx, r#"(function() {
+        document.body.innerHTML = '<div id="editor" contenteditable="true"><b>A😀B</b><i>C</i></div>';
+        const editor = document.getElementById('editor');
+        editor.focus();
+        const text = editor.firstChild.firstChild;
+        document.getSelection().setBaseAndExtent(text, 1, text, 3);
+        globalThis.unicodeEvents = [];
+        editor.addEventListener('beforeinput', e => unicodeEvents.push([e.type,e.data,e.isTrusted,e.cancelable]));
+        editor.addEventListener('input', e => unicodeEvents.push([e.type,e.data,e.isTrusted,e.cancelable]));
+    })()"#).await;
+    assert_eq!(evaluate(&mut ctx, "document.activeElement.id").await, "editor");
+    cdp(&mut ctx, "Input.insertText", json!({"text":"💡"})).await;
+    let v = evaluate(&mut ctx, r#"JSON.stringify((function() {
+        const editor = document.getElementById('editor');
+        const s = document.getSelection();
+        return {text:editor.textContent, first:editor.firstChild.localName,
+            second:editor.lastChild.localName, caret:s.anchorOffset,
+            inside:editor.contains(s.anchorNode), events:unicodeEvents};
+    })())"#).await;
+    let result: Value = serde_json::from_str(v.as_str().unwrap()).unwrap();
+    assert_eq!(result["text"], "A💡BC");
+    assert_eq!(result["first"], "b");
+    assert_eq!(result["second"], "i");
+    assert_eq!(result["inside"], true);
+    assert_eq!(result["caret"], 2, "caret offset must count UTF-16 code units");
+    assert_eq!(result["events"], json!([
+        ["beforeinput","💡",true,true],["input","💡",true,false]
+    ]));
+}
