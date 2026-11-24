@@ -43,7 +43,13 @@ jobs:
       - name: Verify trusted native form submit parity
         run: cargo test --locked -p obscura-cdp --features render --test integration native_submit_event_trust -- --nocapture
       - name: Verify Response.formData compatibility
-        run: cargo test --locked -p obscura-cdp --test integration response_formdata_conformance -- --nocapture
+        # Separate native V8 test processes to avoid shared-isolate contamination.
+        run: |
+          cargo test --locked -p obscura-cdp --test integration response_formdata_conformance::urlencoded_response_formdata_decodes_and_consumes_once -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration response_formdata_conformance::multipart_response_formdata_preserves_file_data -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration response_formdata_conformance::response_formdata_rejects_unknown_content_type_and_clones_are_independent -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration response_formdata_conformance::response_formdata_infers_multipart_mime_and_round_trips_entries -- --exact --nocapture
+          cargo test --locked -p obscura-cdp --test integration response_formdata_conformance::response_bodyinit_infers_other_mime_types_without_overriding_explicit_header -- --exact --nocapture
       - name: Verify bounded module retry policy
         run: cargo test --locked -p obscura-js retry_policy_tests -- --nocapture
       - name: Verify existing module network events

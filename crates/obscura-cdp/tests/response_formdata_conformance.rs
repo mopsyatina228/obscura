@@ -71,3 +71,67 @@ async fn response_formdata_rejects_unknown_content_type_and_clones_are_independe
     })()"#).await;
     assert_eq!(got,json!({"badType":"TypeError","badUsed":true,"original":"1","cloned":"1","used":true,"cloneUsed":true}));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_formdata_infers_multipart_mime_and_round_trips_entries() {
+    let got = evaluate(r#"(async()=>{
+        const data = new FormData();
+        data.append('title','Hello ✓');
+        data.append('title','Second');
+        data.append('file',new File(['abc'],'note.txt',{type:'text/plain'}));
+        const response = new Response(data);
+        const ct = response.headers.get('content-type');
+        const clone = response.clone();
+        const decoded = await response.formData();
+        const file = decoded.get('file');
+        const cloneData = await clone.formData();
+        return {type:ct && ct.startsWith('multipart/form-data; boundary='),
+            boundary:ct && ct.split('boundary=')[1],
+            boundaryMatchesClone:clone.headers.get('content-type')===ct,
+            titles:decoded.getAll('title'),fileName:file.name,fileType:file.type,
+            fileText:await file.text(),cloneTitle:cloneData.get('title'),
+            consumed:response.bodyUsed,cloneConsumed:clone.bodyUsed};
+    })()"#).await;
+    assert_eq!(got["type"],json!(true));
+    assert_eq!(got["boundaryMatchesClone"],json!(true));
+    assert!(got["boundary"].as_str().unwrap().starts_with("----WebKitFormBoundary"));
+    assert_eq!(got["titles"],json!(["Hello ✓","Second"]));
+    assert_eq!(got["fileName"],json!("note.txt"));
+    assert_eq!(got["fileType"],json!("text/plain"));
+    assert_eq!(got["fileText"],json!("abc"));
+    assert_eq!(got["cloneTitle"],json!("Hello ✓"));
+    assert_eq!(got["consumed"],json!(true));
+    assert_eq!(got["cloneConsumed"],json!(true));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_bodyinit_infers_other_mime_types_without_overriding_explicit_header() {
+    let got = evaluate(r#"(async()=>{
+        const form = new URLSearchParams('name=hello+world&name=again');
+        const url = new Response(form);
+        const parsed = await url.formData();
+        const blob = new Response(new Blob(['ok'],{type:'text/plain'}));
+        const string = new Response('hello');
+        const bytes = new Response(new TextEncoder().encode('abc'));
+        const empty = new Response(null);
+        const explicit = new Response(form,{headers:{'Content-Type':'application/custom'}});
+        const formData = new FormData();formData.append('a','1');
+        const multipartExplicit = new Response(formData,{headers:{'content-type':'custom/value'}});
+        return {
+            urlType:url.headers.get('content-type'),urlValues:parsed.getAll('name'),
+            blobType:blob.headers.get('content-type'),blobBody:await blob.text(),
+            stringType:string.headers.get('content-type'),
+            bytesType:bytes.headers.get('content-type'),
+            emptyType:empty.headers.get('content-type'),
+            explicitType:explicit.headers.get('content-type'),
+            multipartExplicitType:multipartExplicit.headers.get('content-type')
+        };
+    })()"#).await;
+    assert_eq!(got,json!({
+        "urlType":"application/x-www-form-urlencoded;charset=UTF-8",
+        "urlValues":["hello world","again"],
+        "blobType":"text/plain","blobBody":"ok",
+        "stringType":"text/plain;charset=UTF-8","bytesType":null,"emptyType":null,
+        "explicitType":"application/custom","multipartExplicitType":"custom/value"
+    }));
+}

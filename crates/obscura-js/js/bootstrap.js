@@ -9542,9 +9542,30 @@ if (typeof Response === 'undefined') {
       const stream = typeof ReadableStream === 'function' && body instanceof ReadableStream ? body : null;
       if (stream && (stream.locked || stream._disturbed)) throw new TypeError('Body stream is locked or disturbed');
       if (stream) this._streamSource = stream;
-      this._bodyBytes = stream ? new Uint8Array() : _bodyToUint8Array(body);
+      // Fetch BodyInit extraction must preserve FormData as multipart bytes,
+      // not stringify it to "[object Object]". The generated boundary and
+      // the inferred MIME type must refer to the same serialization.
+      let inferredContentType = '';
+      let bytes = null;
+      if (!stream && typeof FormData === 'function' && body instanceof FormData) {
+        const multipart = _formDataToMultipart(body);
+        bytes = multipart.body;
+        inferredContentType = 'multipart/form-data; boundary=' + multipart.boundary;
+      } else if (!stream && typeof URLSearchParams === 'function' && body instanceof URLSearchParams) {
+        bytes = new TextEncoder().encode(body.toString());
+        inferredContentType = 'application/x-www-form-urlencoded;charset=UTF-8';
+      } else if (!stream && typeof Blob === 'function' && body instanceof Blob) {
+        inferredContentType = body.type || '';
+      } else if (!stream && typeof body === 'string') {
+        inferredContentType = 'text/plain;charset=UTF-8';
+      }
+      this._bodyBytes = stream ? new Uint8Array() : (bytes || _bodyToUint8Array(body));
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(headers);
+      // Explicit caller Content-Type always wins, including internal responses.
+      if (inferredContentType && !this.headers.has('content-type')) {
+        this.headers.set('content-type', inferredContentType);
+      }
       this.type = internal ? (init.type || 'default') : 'default';
       this.url = internal ? (init.url || '') : '';
       this.redirected = internal && !!init.redirected;
