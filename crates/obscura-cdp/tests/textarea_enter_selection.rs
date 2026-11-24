@@ -261,12 +261,12 @@ async fn insert_text_contenteditable_replaces_selection_and_respects_cancellatio
     let result: Value = serde_json::from_str(v.as_str().unwrap()).unwrap();
     assert_eq!(result["text"], "aZd");
     assert_eq!(result["bold"], "b");
-    assert_eq!(result["caret"], 1);
+    assert_eq!(result["caret"].as_f64(), Some(1.0));
     assert_eq!(result["events"], json!([["beforeinput","Z","insertText",true],["input","Z","insertText",false]]));
     evaluate(&mut ctx, "editor.addEventListener('beforeinput', e => e.preventDefault(), {once:true}); edEvents.length=0;").await;
     cdp(&mut ctx, "Input.insertText", json!({"text":"Q"})).await;
     assert_eq!(evaluate(&mut ctx, "editor.textContent").await, "aZd");
-    assert_eq!(evaluate(&mut ctx, "edEvents.length").await, 1);
+    assert_eq!(evaluate(&mut ctx, "edEvents.length").await.as_f64(), Some(1.0));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -306,7 +306,7 @@ async fn insert_text_contenteditable_unicode_utf16_caret_and_nested_markup() {
     assert_eq!(result["first"], "b");
     assert_eq!(result["second"], "i");
     assert_eq!(result["inside"], true);
-    assert_eq!(result["caret"], 2, "caret offset must count UTF-16 code units");
+    assert_eq!(result["caret"].as_f64(), Some(2.0), "caret offset must count UTF-16 code units");
     assert_eq!(result["events"], json!([
         ["beforeinput","💡",true,true],["input","💡",true,false]
     ]));
