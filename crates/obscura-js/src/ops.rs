@@ -5683,7 +5683,7 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
-    use super::read_body_capped;
+    use super::{read_body_capped, read_body_capped_with_chunks};
     use super::url_set_inner;
     use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_blocks, pbkdf2_can_inline, pbkdf2_derive,
         pbkdf2_derive_with, validate_pbkdf2, CancelPbkdf2OnDrop, push_capped};
