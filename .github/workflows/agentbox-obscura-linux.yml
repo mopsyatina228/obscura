@@ -45,6 +45,10 @@ jobs:
         run: |
           node --check crates/obscura-js/js/bootstrap.js
           node --test crates/obscura-js/tests/fetch_sse_stream_bridge.test.cjs
+      - name: Verify SSE weak abort handle and stream resource lifecycle
+        run: |
+          node --check crates/obscura-js/js/bootstrap.js
+          node --expose-gc --test crates/obscura-js/tests/fetch_stream_lifecycle_ob99.test.cjs
       - name: Run submit event and email regression tests
         run: cargo test --locked -p obscura-cdp --test integration submit_event_email_conformance -- --nocapture
       - name: Run submitter FormData regressions

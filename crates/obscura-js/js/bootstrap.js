@@ -8922,11 +8922,14 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
 // OBMAIN93_STREAM_BRIDGE: one native pull per ReadableStream demand;
 // cancellation closes both the socket resource and its abort registration.
 function _createNativeFetchStream(rid, signal, cleanup) {
-  let closed = false, controller = null, removeAbort = null;
+  // _addAbortAlgorithm stores a WeakRef to its target; keep it reachable
+  // until this stream finishes or cancels, then release it exactly once.
+  let closed = false, controller = null, removeAbort = null, abortHandle = null;
   const finish = () => {
     if (closed) return;
     closed = true;
     if (removeAbort) removeAbort();
+    abortHandle = null;
     cleanup();
   };
   const stop = () => {
@@ -8954,8 +8957,8 @@ function _createNativeFetchStream(rid, signal, cleanup) {
     cancel() { stop(); },
   }, { highWaterMark: 0 });
   if (signal) {
-    const handle = { rid };
-    removeAbort = _addAbortAlgorithm(signal, handle, (target, reason) => {
+    abortHandle = { rid };
+    removeAbort = _addAbortAlgorithm(signal, abortHandle, (target, reason) => {
       if (closed) return;
       stop();
       if (controller) controller.error(reason);
