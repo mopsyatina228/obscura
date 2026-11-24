@@ -8919,6 +8919,51 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+// OBMAIN93_STREAM_BRIDGE: one native pull per ReadableStream demand;
+// cancellation closes both the socket resource and its abort registration.
+function _createNativeFetchStream(rid, signal, cleanup) {
+  let closed = false, controller = null, removeAbort = null;
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    if (removeAbort) removeAbort();
+    cleanup();
+  };
+  const stop = () => {
+    if (closed) return;
+    __obscuraCore.ops.op_try_close(rid);
+    finish();
+  };
+  const stream = new ReadableStream({
+    start(c) { controller = c; },
+    async pull(c) {
+      if (closed) return;
+      try {
+        const chunk = await __obscuraCore.ops.op_fetch_stream_next(rid);
+        if (closed) return;
+        if (!chunk || !chunk.length) { finish(); c.close(); return; }
+        c.enqueue(chunk);
+      } catch (error) {
+        if (closed) return;
+        const state = signal && _abortSignalState(signal);
+        const reason = state && state.aborted ? state.reason : error;
+        stop();
+        c.error(reason);
+      }
+    },
+    cancel() { stop(); },
+  }, { highWaterMark: 0 });
+  if (signal) {
+    const handle = { rid };
+    removeAbort = _addAbortAlgorithm(signal, handle, (target, reason) => {
+      if (closed) return;
+      stop();
+      if (controller) controller.error(reason);
+    });
+  }
+  return stream;
+}
+
 const _requestHeaderGuards = new WeakSet();
 const _forbiddenRequestHeaderNames = new Set([
   'accept-charset', 'accept-encoding', 'access-control-request-headers',
@@ -9017,9 +9062,13 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   }
   const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
-  const responseBody = respType === "opaque"
-    ? null
-    : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
+  // OBMAIN93_STREAM_BRIDGE: no eager op_fetch_body for stream-enabled SSE.
+  // Other response types stay on the original buffered compatibility path.
+  const responseBody = typeof parsed.streamRid === 'number' && respType !== 'opaque'
+    ? _createNativeFetchStream(parsed.streamRid, signal, cleanup)
+    : (respType === "opaque"
+      ? null
+      : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "")));
   const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
@@ -9029,7 +9078,9 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   _attachResponseAbort(response, signal);
-  if (typeof parsed.bodyRid === 'number') {
+  if (typeof parsed.streamRid === 'number' && respType !== 'opaque') {
+    // Its pull/cancel/abort lifecycle owns cleanup, not this fetch promise.
+  } else if (typeof parsed.bodyRid === 'number') {
     // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
     // stream backpressure rather than eagerly queuing every network chunk.
     const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid)

@@ -1213,11 +1213,21 @@ async fn op_fetch_body(
 // OBMAIN92: demand-driven bounded HTTP body. Exactly one transport read
 // per consumer pull; no task or buffer is created behind the consumer.
 // The current public fetch API deliberately remains unchanged.
+// OBMAIN93_STREAM_BRIDGE: keep the CDP network guard alive as long as the
+// actual socket is owned by the streaming resource. Dropping before EOF
+// must still publish ERR_ABORTED/ERR_FAILED; successful EOF publishes finish.
+struct FetchChunkTrace {
+    state: std::rc::Weak<RefCell<OpState>>,
+    guard: FetchNetworkGuard,
+    _in_flight: PageInFlightGuard,
+}
 struct FetchChunkPullResource {
     response: RefCell<Option<reqwest::Response>>,
     cancel: Rc<CancelHandle>,
     remaining: Cell<usize>,
+    limit: usize,
     ended: Cell<bool>,
+    trace: RefCell<Option<FetchChunkTrace>>,
 }
 impl FetchChunkPullResource {
     fn new(
@@ -1230,8 +1240,27 @@ impl FetchChunkPullResource {
         }
         Ok(Self {
             response: RefCell::new(Some(response)), cancel,
-            remaining: Cell::new(max_bytes), ended: Cell::new(false),
+            remaining: Cell::new(max_bytes), limit: max_bytes,
+            ended: Cell::new(false), trace: RefCell::new(None),
         })
+    }
+    fn attach_trace(&self, trace: FetchChunkTrace) {
+        *self.trace.borrow_mut() = Some(trace);
+    }
+    fn finish_network(&self) {
+        let Some(mut trace) = self.trace.borrow_mut().take() else { return; };
+        let Some(mut event) = trace.guard.event.take() else { return; };
+        event.body_size = self.limit - self.remaining.get();
+        event.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64();
+        if let Some(state) = trace.state.upgrade() {
+            let op = state.borrow();
+            let shared = op.borrow::<SharedState>().clone();
+            let mut gs = shared.borrow_mut();
+            // A live SSE stream is not cached as a complete CDP response body.
+            push_js_network_event(&mut gs, event);
+        }
     }
     async fn pull(&self) -> Result<Option<Vec<u8>>, deno_error::JsErrorBox> {
         if self.ended.get() { return Ok(None); }
@@ -1253,6 +1282,7 @@ impl FetchChunkPullResource {
             match part {
                 None => {
                     self.ended.set(true);
+                    self.finish_network();
                     return Ok(None);
                 }
                 Some(bytes) if bytes.is_empty() => continue,
@@ -1284,6 +1314,7 @@ impl Resource for FetchChunkPullResource {
         self.cancel.cancel();
         self.ended.set(true);
         self.response.borrow_mut().take();
+        self.trace.borrow_mut().take();
     }
 }
 // Internal op: zero bytes means EOF. No producer or unbounded buffering.
@@ -5120,6 +5151,42 @@ async fn fetch_url_inner(
         "opaque": opaque,
         "headers": script_headers,
     });
+    // OBMAIN93_STREAM_BRIDGE: enable true demand-driven body reads for
+    // ordinary same-policy, non-intercepted GET text/event-stream responses.
+    // All scripts, XHR, callbacks, opaque replies, stealth transport and
+    // non-SSE fetches retain the existing buffered/observable behavior.
+    let is_sse = resp_headers.get("content-type").is_some_and(|value|
+        value.split(';').next().is_some_and(|media|
+            media.trim().eq_ignore_ascii_case("text/event-stream")));
+    let response_observed = if is_sse {
+        if let Some(ref cbs) = callbacks { cbs.has_response_callbacks().await }
+        else { false }
+    } else { false };
+    if is_sse && !internal_load && !opaque && !was_intercepted
+        && !response_observed && current_method == reqwest::Method::GET
+        && matches!(&resource_type, ResourceType::Fetch)
+    {
+        let stream_cancel = cancel.unwrap_or_else(CancelHandle::new_rc);
+        let stream = FetchChunkPullResource::new(
+            response, fetch_max_body_bytes(), stream_cancel,
+        )?;
+        // Preserve actual HTTP status and response headers for CDP finish.
+        if let Some(event) = network_guard.event.as_mut() {
+            event.status = status;
+            event.url = current_url;
+            event.method = current_method.as_str().to_string();
+            event.response_headers = resp_headers;
+        }
+        stream.attach_trace(FetchChunkTrace {
+            state: Rc::downgrade(&state),
+            guard: network_guard,
+            _in_flight: _page_in_flight,
+        });
+        let rid = state.borrow_mut().resource_table.add(stream);
+        let mut metadata = metadata;
+        metadata["streamRid"] = serde_json::json!(rid);
+        return Ok(metadata.to_string());
+    }
     // A resource must not form an ownership cycle with its OpState table.
     let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
