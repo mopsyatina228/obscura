@@ -1272,7 +1272,7 @@ impl FetchChunkPullResource {
                 Ok(Ok(part)) => part,
                 Ok(Err(error)) => {
                     self.ended.set(true);
-                    return Err(deno_error::JsErrorBox::generic(error.to_string()));
+                    return Err(deno_error::JsErrorBox::type_error(error.to_string()));
                 }
                 Err(_) => {
                     self.ended.set(true);
@@ -6384,6 +6384,40 @@ mod tests {
         ).await.unwrap().unwrap().unwrap();
         assert_eq!(second, b"data: second\n\n");
         assert!(reader.pull().await.unwrap().is_none());
+        assert!(reader.pull().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_pull_resource_truncated_transport_is_type_error() {
+        use deno_error::JsErrorClass;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, pending) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\ndata: dummy\n\n").await.unwrap();
+            pending.await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy().timeout(std::time::Duration::from_secs(5))
+            .build().unwrap()
+            .get(format!("http://{addr}/")).send().await.unwrap();
+        let reader = super::FetchChunkPullResource::new(
+            response, 1024, deno_core::CancelHandle::new_rc()
+        ).unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(3), reader.pull()
+        ).await.unwrap().unwrap().unwrap();
+        assert_eq!(first, b"data: dummy\n\n");
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3), reader.pull()
+        ).await.unwrap().expect_err("truncated response must reject");
+        assert_eq!(error.get_class().as_ref(), "TypeError");
         assert!(reader.pull().await.unwrap().is_none());
         server.await.unwrap();
     }
